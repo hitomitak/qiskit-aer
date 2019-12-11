@@ -30,6 +30,11 @@
 
 #include "framework/json.hpp"
 
+#ifdef SIMD_PPC64LE
+#include<altivec.h>
+#endif
+
+
 namespace QV {
 
 // Type aliases
@@ -265,6 +270,19 @@ public:
   void apply_permutation_matrix(const reg_t &qubits,
                                 const std::vector<std::pair<uint_t, uint_t>> &pairs);
 
+#ifdef SIMD_PPC64LE
+  // Apply a 1-qubit matrix to the state vector.
+  // The matrix is input as vector of the column-major vectorized 1-qubit matrix.
+  void apply_matrix_ppc64le(const uint_t qubit, const cvector_t<double> &mat);
+
+  // Apply a N-qubit matrix to the state vector.
+  // The matrix is input as vector of the column-major vectorized N-qubit matrix.
+  void apply_matrix_ppc64le(const reg_t &qubits, const cvector_t<double> &mat);
+  
+  // Apply a N-qubit diagonal matrix to the state vector.
+  // The matrix is input as vector of the matrix diagonal.
+  void apply_diagonal_matrix_ppc64le(const reg_t &qubits, const cvector_t<double> &mat);
+#endif //SIMD_PPC64LE
   //-----------------------------------------------------------------------
   // Apply Specialized Gates
   //-----------------------------------------------------------------------
@@ -400,6 +418,11 @@ protected:
   size_t data_size_;
   std::complex<data_t>* data_;
   std::complex<data_t>* checkpoint_;
+
+  // If data_t is double, SIMD function is enable
+#ifdef SIMD_PPC64LE
+  bool type_double = ((typeid(data_t) == typeid(double)) ? true : false);
+#endif
 
   //-----------------------------------------------------------------------
   // Config settings
@@ -1099,6 +1122,9 @@ template <typename data_t>
 void QubitVector<data_t>::apply_matrix(const reg_t &qubits,
                                        const cvector_t<double> &mat) {
 
+#ifdef SIMD_PPC64LE
+	apply_matrix_ppc64le(qubits, mat);
+#else
   const size_t N = qubits.size();
   // Error checking
   #ifdef DEBUG
@@ -1179,6 +1205,7 @@ void QubitVector<data_t>::apply_matrix(const reg_t &qubits,
       apply_lambda(lambda, qubits, convert(mat));
     }
   } // end switch
+#endif //#ifdef SIMD_PPC64LE
 }
 
 template <typename data_t>
@@ -1218,7 +1245,9 @@ void QubitVector<data_t>::apply_multiplexer(const reg_t &control_qubits,
 template <typename data_t>
 void QubitVector<data_t>::apply_diagonal_matrix(const reg_t &qubits,
                                                 const cvector_t<double> &diag) {
-
+#ifdef SIMD_PPC64LE
+  apply_diagonal_matrix_ppc64le(qubits, diag);
+#else
   const int_t N = qubits.size();
   // Error checking
   #ifdef DEBUG
@@ -1242,6 +1271,7 @@ void QubitVector<data_t>::apply_diagonal_matrix(const reg_t &qubits,
     }
   };
   apply_lambda(lambda, areg_t<1>({{qubits[0]}}), convert(diag));
+#endif
 }
 
 template <typename data_t>
@@ -1618,6 +1648,9 @@ template <typename data_t>
 void QubitVector<data_t>::apply_matrix(const uint_t qubit,
                                        const cvector_t<double>& mat) {
 
+#ifdef SIMD_PPC64LE
+  apply_matrix_ppc64le(qubit, mat);
+#else 
   // Check if matrix is diagonal and if so use optimized lambda
   if (mat[1] == 0.0 && mat[2] == 0.0) {
     const cvector_t<double> diag = {{mat[0], mat[3]}};
@@ -1677,6 +1710,7 @@ void QubitVector<data_t>::apply_matrix(const uint_t qubit,
     data_[inds[1]] = _mat[1] * cache + _mat[3] * data_[inds[1]];
   };
   apply_lambda(lambda, qubits, convert(mat));
+#endif
 }
 
 template <typename data_t>
@@ -2135,6 +2169,495 @@ reg_t QubitVector<data_t>::sample_measure(const std::vector<double> &rnds) const
   }
   return samples;
 }
+
+#ifdef SIMD_PPC64LE
+//------------------------------------------------------------------------------
+// Single-qubit matrices
+//------------------------------------------------------------------------------
+
+const __vector unsigned char vpat = {
+                0x08, 0x09, 0x0A, 0x0B,
+                0x0C, 0x0D, 0x0E, 0x0F,
+                0x00, 0x01, 0x02, 0x03,
+                0x04, 0x05, 0x06, 0x07};
+
+inline __vector double complex_mul(__vector double vec, __vector double imag, __vector double real){
+        __vector double perm = vec_perm(vec, vec, vpat);
+        __vector double temp1 = vec_mul(real, vec);
+        __vector double temp2 = vec_mul(imag, perm);
+        return vec_sub(temp1, temp2);
+}
+
+template <typename data_t>
+void QubitVector<data_t>::apply_matrix_ppc64le(const uint_t qubit,
+                                       const cvector_t<double>& mat) {
+  // Check if matrix is diagonal and if so use optimized lambda
+  if (mat[1] == 0.0 && mat[2] == 0.0) {
+    const cvector_t<double> diag = {{mat[0], mat[3]}};
+    apply_diagonal_matrix(qubit, diag);
+    return;
+  }
+  
+  // Convert qubit to array register for lambda functions
+  areg_t<1> qubits = {{qubit}};
+
+  // Check if anti-diagonal matrix and if so use optimized lambda
+  if(mat[0] == 0.0 && mat[3] == 0.0) {
+    if (mat[1] == 1.0 && mat[2] == 1.0) {
+      // X-matrix
+      auto lambda = [&](const areg_t<2> &inds)->void {
+        std::swap(data_[inds[0]], data_[inds[1]]);
+      };
+      apply_lambda(lambda, qubits);
+      return;
+    }
+    if (mat[2] == 0.0) {
+      // Non-unitary projector
+      // possibly used in measure/reset/kraus update
+      auto lambda = [&](const areg_t<2> &inds,
+                        const cvector_t<data_t> &_mat)->void {
+        data_[inds[1]] = _mat[1] * data_[inds[0]];
+        data_[inds[0]] = 0.0;
+      };
+      apply_lambda(lambda, qubits, convert(mat));
+      return;
+    }
+    if (mat[1] == 0.0) {
+      // Non-unitary projector
+      // possibly used in measure/reset/kraus update
+      auto lambda = [&](const areg_t<2> &inds,
+                        const cvector_t<data_t> &_mat)->void {
+        data_[inds[0]] = _mat[2] * data_[inds[1]];
+        data_[inds[1]] = 0.0;
+      };
+      apply_lambda(lambda, qubits, convert(mat));
+      return;
+    }
+    // else we have a general anti-diagonal matrix
+    auto lambda = [&](const areg_t<2> &inds,
+                      const cvector_t<data_t> &_mat)->void {
+      const std::complex<data_t> cache = data_[inds[0]];
+      data_[inds[0]] = _mat[2] * data_[inds[1]];
+      data_[inds[1]] = _mat[1] * cache;
+    };
+    apply_lambda(lambda, qubits, convert(mat));
+    return;
+  }
+  if(type_double) {
+    __vector double real[4];
+    __vector double imag[4];
+
+    int mat_vec_index = 0;
+    for(int i = 0; i < 2; i++){
+      for(int j = 0; j < 2; j++){ 
+        real[mat_vec_index] = (__vector double){mat[i+j*2].real(), mat[i+j*2].real()}; 
+	imag[mat_vec_index] = (__vector double){mat[i+j*2].imag(), mat[i+j*2].imag() * -1}; 
+	mat_vec_index = mat_vec_index+1;
+      }
+    }
+
+    auto lambda = [&](const areg_t<2> &inds, const cvector_t<data_t> &_mat)->void {
+      __vector double vec[2];
+      vec[0] = (__vector double){data_[inds[0]].real(), data_[inds[0]].imag()};
+      vec[1] = (__vector double){data_[inds[1]].real(), data_[inds[1]].imag()};
+
+      __vector double result = vec_add(complex_mul(vec[0],imag[0],real[0]), complex_mul(vec[1],imag[1],real[1]));
+      data_[inds[0]] = std::complex<double>((double)result[0], (double)result[1]);
+      result = vec_add(complex_mul(vec[0],imag[2],real[2]), complex_mul(vec[1],imag[3],real[3]));
+      data_[inds[1]] = std::complex<double>((double)result[0], (double)result[1]);
+    };
+    apply_lambda(lambda, qubits, convert(mat));
+  } else {
+    // Otherwise general single-qubit matrix multiplication
+    auto lambda = [&](const areg_t<2> &inds, const cvector_t<data_t> &_mat)->void {
+      const auto cache = data_[inds[0]];
+      data_[inds[0]] = _mat[0] * cache + _mat[2] * data_[inds[1]];
+      data_[inds[1]] = _mat[1] * cache + _mat[3] * data_[inds[1]];
+    };
+    apply_lambda(lambda, qubits, convert(mat));
+ }
+}
+
+/*******************************************************************************
+ *
+ * MATRIX MULTIPLICATION
+ *
+ ******************************************************************************/
+template <typename data_t>
+void QubitVector<data_t>::apply_matrix_ppc64le(const reg_t &qubits,
+                                       const cvector_t<double> &mat) {
+
+  const size_t N = qubits.size();
+  // Error checking
+  #ifdef DEBUG
+  check_vector(mat, 2 * N);
+  #endif
+
+  // Static array optimized lambda functions
+  switch (N) {
+    case 1:
+      apply_matrix(qubits[0], mat);
+      return;
+    case 2: {
+      if(type_double) {
+        __vector double real[16];
+        __vector double imag[16]; 
+	int mat_vec_index = 0;
+
+        for(int i = 0; i < 4; i++){
+          for(int j = 0; j < 4; j++){
+	    real[mat_vec_index] = (__vector double){mat[i+j*4].real(), mat[i+j*4].real()};
+	    imag[mat_vec_index] = (__vector double){mat[i+j*4].imag(), mat[i+j*4].imag() * -1};
+            mat_vec_index = mat_vec_index+1;
+	  }
+        }
+
+        auto lambda = [&](const areg_t<4> &inds, const cvector_t<data_t> &_mat)->void {
+          __vector double vec[4];
+
+          vec[0] = (__vector double){data_[inds[0]].real(), data_[inds[0]].imag()};
+          vec[1] = (__vector double){data_[inds[1]].real(), data_[inds[1]].imag()};
+          vec[2] = (__vector double){data_[inds[2]].real(), data_[inds[2]].imag()};
+          vec[3] = (__vector double){data_[inds[3]].real(), data_[inds[3]].imag()};
+
+          __vector double result = vec_add(vec_add(complex_mul(vec[0],imag[0],real[0]), complex_mul(vec[1],imag[1],real[1])),vec_add(complex_mul(vec[2],imag[2],real[2]), complex_mul(vec[3],imag[3],real[3])));
+          data_[inds[0]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(vec_add(complex_mul(vec[0],imag[4],real[4]), complex_mul(vec[1],imag[5],real[5])),vec_add(complex_mul(vec[2],imag[6],real[6]), complex_mul(vec[3],imag[7],real[7])));
+          data_[inds[1]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(vec_add(complex_mul(vec[0],imag[8],real[8]), complex_mul(vec[1],imag[9],real[9])),vec_add(complex_mul(vec[2],imag[10],real[10]), complex_mul(vec[3],imag[11],real[11])));
+          data_[inds[2]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(vec_add(complex_mul(vec[0],imag[12],real[12]), complex_mul(vec[1],imag[13],real[13])),vec_add(complex_mul(vec[2],imag[14],real[14]), complex_mul(vec[3],imag[15],real[15])));
+          data_[inds[3]] = std::complex<double>((double)result[0], (double)result[1]);
+        };
+        apply_lambda(lambda, areg_t<2>({{qubits[0], qubits[1]}}), convert(mat));
+	return;
+      } else {
+      // Lambda function for 2-qubit matrix multiplication
+        auto lambda = [&](const areg_t<4> &inds, const cvector_t<data_t> &_mat)->void {
+          std::array<std::complex<data_t>, 4> cache;
+          for (size_t i = 0; i < 4; i++) {
+            const auto ii = inds[i];
+            cache[i] = data_[ii];
+            data_[ii] = 0.;
+          }
+        // update state vector
+          for (size_t i = 0; i < 4; i++)
+            for (size_t j = 0; j < 4; j++)
+              data_[inds[i]] += _mat[i + 4 * j] * cache[j];
+        };
+        apply_lambda(lambda, areg_t<2>({{qubits[0], qubits[1]}}), convert(mat));
+      return;
+      }
+    }
+    case 3: {
+      if(type_double) {
+        __vector double real[64];
+        __vector double imag[64]; 
+	int mat_vec_index = 0;
+        for(int i = 0; i < 8; i++){
+          for(int j = 0; j < 8; j++){
+	    real[mat_vec_index] = (__vector double){mat[i+j*8].real(), mat[i+j*8].real()};
+	    imag[mat_vec_index] = (__vector double){mat[i+j*8].imag(), mat[i+j*8].imag() * -1};
+            mat_vec_index = mat_vec_index+1;
+	  }
+        }
+        // Lambda function for 3-qubit matrix multiplication
+        auto lambda = [&](const areg_t<8> &inds, const cvector_t<data_t> &_mat)->void {
+          __vector double vec[4];
+          __vector double temp[8];
+          __vector double result;
+
+          vec[0] = (__vector double){data_[inds[0]].real(), data_[inds[0]].imag()};
+          vec[1] = (__vector double){data_[inds[1]].real(), data_[inds[1]].imag()};
+          vec[2] = (__vector double){data_[inds[2]].real(), data_[inds[2]].imag()};
+          vec[3] = (__vector double){data_[inds[3]].real(), data_[inds[3]].imag()};
+
+          temp[0] = vec_add(vec_add(complex_mul(vec[0],imag[0],real[0]), complex_mul(vec[1],imag[1],real[1])),vec_add(complex_mul(vec[2],imag[2],real[2]), complex_mul(vec[3],imag[3],real[3])));
+          temp[1] = vec_add(vec_add(complex_mul(vec[0],imag[8],real[8]), complex_mul(vec[1],imag[9],real[9])),vec_add(complex_mul(vec[2],imag[10],real[10]), complex_mul(vec[3],imag[11],real[11])));
+          temp[2] = vec_add(vec_add(complex_mul(vec[0],imag[16],real[16]), complex_mul(vec[1],imag[17],real[17])),vec_add(complex_mul(vec[2],imag[18],real[18]), complex_mul(vec[3],imag[19],real[19])));
+          temp[3] = vec_add(vec_add(complex_mul(vec[0],imag[24],real[24]), complex_mul(vec[1],imag[25],real[25])),vec_add(complex_mul(vec[2],imag[26],real[26]), complex_mul(vec[3],imag[27],real[27])));
+          temp[4] = vec_add(vec_add(complex_mul(vec[0],imag[32],real[32]), complex_mul(vec[1],imag[33],real[33])),vec_add(complex_mul(vec[2],imag[34],real[34]), complex_mul(vec[3],imag[35],real[35])));
+          temp[5] = vec_add(vec_add(complex_mul(vec[0],imag[40],real[40]), complex_mul(vec[1],imag[41],real[41])),vec_add(complex_mul(vec[2],imag[42],real[42]), complex_mul(vec[3],imag[43],real[43])));
+          temp[6] = vec_add(vec_add(complex_mul(vec[0],imag[48],real[48]), complex_mul(vec[1],imag[49],real[49])),vec_add(complex_mul(vec[2],imag[50],real[50]), complex_mul(vec[3],imag[51],real[51])));
+          temp[7] = vec_add(vec_add(complex_mul(vec[0],imag[56],real[56]), complex_mul(vec[1],imag[57],real[57])),vec_add(complex_mul(vec[2],imag[58],real[58]), complex_mul(vec[3],imag[59],real[59])));
+
+          vec[0] = (__vector double){data_[inds[4]].real(), data_[inds[4]].imag()};
+          vec[1] = (__vector double){data_[inds[5]].real(), data_[inds[5]].imag()};
+          vec[2] = (__vector double){data_[inds[6]].real(), data_[inds[6]].imag()};
+          vec[3] = (__vector double){data_[inds[7]].real(), data_[inds[7]].imag()};
+
+          result = vec_add(temp[0], vec_add(vec_add(complex_mul(vec[0],imag[4],real[4]), complex_mul(vec[1],imag[5],real[5])),vec_add(complex_mul(vec[2],imag[6],real[6]), complex_mul(vec[3],imag[7],real[7]))));
+          data_[inds[0]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[1], vec_add(vec_add(complex_mul(vec[0],imag[12],real[12]), complex_mul(vec[1],imag[13],real[13])),vec_add(complex_mul(vec[2],imag[14],real[14]), complex_mul(vec[3],imag[15],real[15]))));
+          data_[inds[1]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[2], vec_add(vec_add(complex_mul(vec[0],imag[20],real[20]), complex_mul(vec[1],imag[21],real[21])),vec_add(complex_mul(vec[2],imag[22],real[22]), complex_mul(vec[3],imag[23],real[23]))));
+          data_[inds[2]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[3], vec_add(vec_add(complex_mul(vec[0],imag[28],real[28]), complex_mul(vec[1],imag[29],real[29])),vec_add(complex_mul(vec[2],imag[30],real[30]), complex_mul(vec[3],imag[31],real[31]))));
+          data_[inds[3]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[4], vec_add(vec_add(complex_mul(vec[0],imag[36],real[36]), complex_mul(vec[1],imag[37],real[37])),vec_add(complex_mul(vec[2],imag[38],real[38]), complex_mul(vec[3],imag[39],real[39]))));
+          data_[inds[4]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[5], vec_add(vec_add(complex_mul(vec[0],imag[44],real[44]), complex_mul(vec[1],imag[45],real[45])),vec_add(complex_mul(vec[2],imag[46],real[46]), complex_mul(vec[3],imag[47],real[47]))));
+          data_[inds[5]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[6], vec_add(vec_add(complex_mul(vec[0],imag[52],real[52]), complex_mul(vec[1],imag[53],real[53])),vec_add(complex_mul(vec[2],imag[54],real[54]), complex_mul(vec[3],imag[55],real[55]))));
+          data_[inds[6]] = std::complex<double>((double)result[0], (double)result[1]);
+          result = vec_add(temp[7], vec_add(vec_add(complex_mul(vec[0],imag[60],real[60]), complex_mul(vec[1],imag[61],real[61])),vec_add(complex_mul(vec[2],imag[62],real[62]), complex_mul(vec[3],imag[63],real[63]))));
+          data_[inds[7]] = std::complex<double>((double)result[0], (double)result[1]);
+        };
+        apply_lambda(lambda, areg_t<3>({{qubits[0], qubits[1], qubits[2]}}), convert(mat));
+        return;
+      } else {
+        // Lambda function for 3-qubit matrix multiplication
+        auto lambda = [&](const areg_t<8> &inds, const cvector_t<data_t> &_mat)->void {
+          std::array<std::complex<data_t>, 8> cache;
+          for (size_t i = 0; i < 8; i++) {
+            const auto ii = inds[i];
+            cache[i] = data_[ii];
+            data_[ii] = 0.;
+          }
+          // update state vector
+          for (size_t i = 0; i < 8; i++)
+            for (size_t j = 0; j < 8; j++)
+              data_[inds[i]] += _mat[i + 8 * j] * cache[j];
+        };
+        apply_lambda(lambda, areg_t<3>({{qubits[0], qubits[1], qubits[2]}}), convert(mat));
+        return;
+      }
+    }
+    case 4: {
+      if(type_double) {
+        __vector double real[256];
+        __vector double imag[256]; 
+        int mat_vec_index = 0;
+        for(int i = 0; i < 16; i++){
+          for(int j = 0; j < 16; j++){
+	    real[mat_vec_index] = (__vector double){mat[i+j*16].real(), mat[i+j*16].real()};
+	    imag[mat_vec_index] = (__vector double){mat[i+j*16].imag(), mat[i+j*16].imag() * -1};
+            mat_vec_index = mat_vec_index+1;
+	  }
+        }
+	
+      // Lambda function for 4-qubit matrix multiplication
+      auto lambda = [&](const areg_t<16> &inds, const cvector_t<data_t> &_mat)->void {
+        __vector double vec[4];
+        __vector double temp[16];
+        __vector double result;
+
+
+        vec[0] = (__vector double){data_[inds[0]].real(), data_[inds[0]].imag()};
+        vec[1] = (__vector double){data_[inds[1]].real(), data_[inds[1]].imag()};
+        vec[2] = (__vector double){data_[inds[2]].real(), data_[inds[2]].imag()};
+        vec[3] = (__vector double){data_[inds[3]].real(), data_[inds[3]].imag()};
+
+        temp[0] = vec_add(vec_add(complex_mul(vec[0],imag[0],real[0]), complex_mul(vec[1],imag[1],real[1])),vec_add(complex_mul(vec[2],imag[2],real[2]), complex_mul(vec[3],imag[3],real[3])));
+        temp[1] = vec_add(vec_add(complex_mul(vec[0],imag[16],real[16]), complex_mul(vec[1],imag[17],real[17])),vec_add(complex_mul(vec[2],imag[18],real[18]), complex_mul(vec[3],imag[19],real[19])));
+        temp[2] = vec_add(vec_add(complex_mul(vec[0],imag[32],real[32]), complex_mul(vec[1],imag[33],real[33])),vec_add(complex_mul(vec[2],imag[34],real[34]), complex_mul(vec[3],imag[35],real[35])));
+        temp[3] = vec_add(vec_add(complex_mul(vec[0],imag[48],real[48]), complex_mul(vec[1],imag[49],real[49])),vec_add(complex_mul(vec[2],imag[50],real[50]), complex_mul(vec[3],imag[51],real[51])));
+        temp[4] = vec_add(vec_add(complex_mul(vec[0],imag[64],real[64]), complex_mul(vec[1],imag[65],real[65])),vec_add(complex_mul(vec[2],imag[66],real[66]), complex_mul(vec[3],imag[67],real[67])));
+        temp[5] = vec_add(vec_add(complex_mul(vec[0],imag[80],real[80]), complex_mul(vec[1],imag[81],real[81])),vec_add(complex_mul(vec[2],imag[82],real[82]), complex_mul(vec[3],imag[83],real[83])));
+        temp[6] = vec_add(vec_add(complex_mul(vec[0],imag[96],real[96]), complex_mul(vec[1],imag[97],real[97])),vec_add(complex_mul(vec[2],imag[98],real[98]), complex_mul(vec[3],imag[99],real[99])));
+        temp[7] = vec_add(vec_add(complex_mul(vec[0],imag[112],real[112]), complex_mul(vec[1],imag[113],real[113])),vec_add(complex_mul(vec[2],imag[114],real[114]), complex_mul(vec[3],imag[115],real[115])));
+        temp[8] = vec_add(vec_add(complex_mul(vec[0],imag[128],real[128]), complex_mul(vec[1],imag[129],real[129])),vec_add(complex_mul(vec[2],imag[130],real[130]), complex_mul(vec[3],imag[131],real[131])));
+        temp[9] = vec_add(vec_add(complex_mul(vec[0],imag[144],real[144]), complex_mul(vec[1],imag[145],real[145])),vec_add(complex_mul(vec[2],imag[146],real[146]), complex_mul(vec[3],imag[147],real[147])));
+        temp[10] = vec_add(vec_add(complex_mul(vec[0],imag[160],real[160]), complex_mul(vec[1],imag[161],real[161])),vec_add(complex_mul(vec[2],imag[162],real[162]), complex_mul(vec[3],imag[163],real[163])));
+        temp[11] = vec_add(vec_add(complex_mul(vec[0],imag[176],real[176]), complex_mul(vec[1],imag[177],real[177])),vec_add(complex_mul(vec[2],imag[178],real[178]), complex_mul(vec[3],imag[179],real[179])));
+        temp[12] = vec_add(vec_add(complex_mul(vec[0],imag[192],real[192]), complex_mul(vec[1],imag[193],real[193])),vec_add(complex_mul(vec[2],imag[194],real[194]), complex_mul(vec[3],imag[195],real[195])));
+        temp[13] = vec_add(vec_add(complex_mul(vec[0],imag[208],real[208]), complex_mul(vec[1],imag[209],real[209])),vec_add(complex_mul(vec[2],imag[210],real[210]), complex_mul(vec[3],imag[211],real[211])));
+        temp[14] = vec_add(vec_add(complex_mul(vec[0],imag[224],real[224]), complex_mul(vec[1],imag[225],real[225])),vec_add(complex_mul(vec[2],imag[226],real[226]), complex_mul(vec[3],imag[227],real[227])));
+        temp[15] = vec_add(vec_add(complex_mul(vec[0],imag[240],real[240]), complex_mul(vec[1],imag[241],real[241])),vec_add(complex_mul(vec[2],imag[242],real[242]), complex_mul(vec[3],imag[243],real[243])));
+
+        vec[0] = (__vector double){data_[inds[4]].real(), data_[inds[4]].imag()};
+        vec[1] = (__vector double){data_[inds[5]].real(), data_[inds[5]].imag()};
+        vec[2] = (__vector double){data_[inds[6]].real(), data_[inds[6]].imag()};
+        vec[3] = (__vector double){data_[inds[7]].real(), data_[inds[7]].imag()};
+    
+        temp[0] = vec_add(temp[0], vec_add(vec_add(complex_mul(vec[0],imag[4],real[4]), complex_mul(vec[1],imag[5],real[5])),vec_add(complex_mul(vec[2],imag[6],real[6]), complex_mul(vec[3],imag[7],real[7]))));
+        temp[1] = vec_add(temp[1], vec_add(vec_add(complex_mul(vec[0],imag[20],real[20]), complex_mul(vec[1],imag[21],real[21])),vec_add(complex_mul(vec[2],imag[22],real[22]), complex_mul(vec[3],imag[23],real[23]))));
+        temp[2] = vec_add(temp[2], vec_add(vec_add(complex_mul(vec[0],imag[36],real[36]), complex_mul(vec[1],imag[37],real[37])),vec_add(complex_mul(vec[2],imag[38],real[38]), complex_mul(vec[3],imag[39],real[39]))));
+        temp[3] = vec_add(temp[3], vec_add(vec_add(complex_mul(vec[0],imag[52],real[52]), complex_mul(vec[1],imag[53],real[53])),vec_add(complex_mul(vec[2],imag[54],real[54]), complex_mul(vec[3],imag[55],real[55]))));
+        temp[4] = vec_add(temp[4], vec_add(vec_add(complex_mul(vec[0],imag[68],real[68]), complex_mul(vec[1],imag[69],real[69])),vec_add(complex_mul(vec[2],imag[70],real[70]), complex_mul(vec[3],imag[71],real[71]))));
+        temp[5] = vec_add(temp[5], vec_add(vec_add(complex_mul(vec[0],imag[84],real[84]), complex_mul(vec[1],imag[85],real[85])),vec_add(complex_mul(vec[2],imag[86],real[86]), complex_mul(vec[3],imag[87],real[87]))));
+        temp[6] = vec_add(temp[6], vec_add(vec_add(complex_mul(vec[0],imag[100],real[100]), complex_mul(vec[1],imag[101],real[101])),vec_add(complex_mul(vec[2],imag[102],real[102]), complex_mul(vec[3],imag[103],real[103]))));
+        temp[7] = vec_add(temp[7], vec_add(vec_add(complex_mul(vec[0],imag[116],real[116]), complex_mul(vec[1],imag[117],real[117])),vec_add(complex_mul(vec[2],imag[118],real[118]), complex_mul(vec[3],imag[119],real[119]))));
+        temp[8] = vec_add(temp[8], vec_add(vec_add(complex_mul(vec[0],imag[132],real[132]), complex_mul(vec[1],imag[133],real[133])),vec_add(complex_mul(vec[2],imag[134],real[134]), complex_mul(vec[3],imag[135],real[135]))));
+        temp[9] = vec_add(temp[9], vec_add(vec_add(complex_mul(vec[0],imag[148],real[148]), complex_mul(vec[1],imag[149],real[149])),vec_add(complex_mul(vec[2],imag[150],real[150]), complex_mul(vec[3],imag[151],real[151]))));
+        temp[10] = vec_add(temp[10], vec_add(vec_add(complex_mul(vec[0],imag[164],real[164]), complex_mul(vec[1],imag[165],real[165])),vec_add(complex_mul(vec[2],imag[166],real[166]), complex_mul(vec[3],imag[167],real[167]))));
+        temp[11] = vec_add(temp[11], vec_add(vec_add(complex_mul(vec[0],imag[180],real[180]), complex_mul(vec[1],imag[181],real[181])),vec_add(complex_mul(vec[2],imag[182],real[182]), complex_mul(vec[3],imag[183],real[183]))));
+        temp[12] = vec_add(temp[12], vec_add(vec_add(complex_mul(vec[0],imag[196],real[196]), complex_mul(vec[1],imag[197],real[197])),vec_add(complex_mul(vec[2],imag[198],real[198]), complex_mul(vec[3],imag[199],real[199]))));
+        temp[13] = vec_add(temp[13], vec_add(vec_add(complex_mul(vec[0],imag[212],real[212]), complex_mul(vec[1],imag[213],real[213])),vec_add(complex_mul(vec[2],imag[214],real[214]), complex_mul(vec[3],imag[215],real[215]))));
+        temp[14] = vec_add(temp[14], vec_add(vec_add(complex_mul(vec[0],imag[228],real[228]), complex_mul(vec[1],imag[229],real[229])),vec_add(complex_mul(vec[2],imag[230],real[230]), complex_mul(vec[3],imag[231],real[231]))));
+        temp[15] = vec_add(temp[15], vec_add(vec_add(complex_mul(vec[0],imag[244],real[244]), complex_mul(vec[1],imag[245],real[245])),vec_add(complex_mul(vec[2],imag[246],real[246]), complex_mul(vec[3],imag[247],real[247]))));
+    
+        vec[0] = (__vector double){data_[inds[8]].real(), data_[inds[8]].imag()};
+        vec[1] = (__vector double){data_[inds[9]].real(), data_[inds[9]].imag()};
+        vec[2] = (__vector double){data_[inds[10]].real(), data_[inds[10]].imag()};
+        vec[3] = (__vector double){data_[inds[11]].real(), data_[inds[11]].imag()};
+    
+        temp[0] = vec_add(temp[0], vec_add(vec_add(complex_mul(vec[0],imag[8],real[8]), complex_mul(vec[1],imag[9],real[9])),vec_add(complex_mul(vec[2],imag[10],real[10]), complex_mul(vec[3],imag[11],real[11]))));
+        temp[1] = vec_add(temp[1], vec_add(vec_add(complex_mul(vec[0],imag[24],real[24]), complex_mul(vec[1],imag[25],real[25])),vec_add(complex_mul(vec[2],imag[26],real[26]), complex_mul(vec[3],imag[27],real[27]))));
+        temp[2] = vec_add(temp[2], vec_add(vec_add(complex_mul(vec[0],imag[40],real[40]), complex_mul(vec[1],imag[41],real[41])),vec_add(complex_mul(vec[2],imag[42],real[42]), complex_mul(vec[3],imag[43],real[43]))));
+        temp[3] = vec_add(temp[3], vec_add(vec_add(complex_mul(vec[0],imag[56],real[56]), complex_mul(vec[1],imag[57],real[57])),vec_add(complex_mul(vec[2],imag[58],real[58]), complex_mul(vec[3],imag[59],real[59]))));
+        temp[4] = vec_add(temp[4], vec_add(vec_add(complex_mul(vec[0],imag[72],real[72]), complex_mul(vec[1],imag[73],real[73])),vec_add(complex_mul(vec[2],imag[74],real[74]), complex_mul(vec[3],imag[75],real[75]))));
+        temp[5] = vec_add(temp[5], vec_add(vec_add(complex_mul(vec[0],imag[88],real[88]), complex_mul(vec[1],imag[89],real[89])),vec_add(complex_mul(vec[2],imag[90],real[90]), complex_mul(vec[3],imag[91],real[91]))));
+        temp[6] = vec_add(temp[6], vec_add(vec_add(complex_mul(vec[0],imag[104],real[104]), complex_mul(vec[1],imag[105],real[105])),vec_add(complex_mul(vec[2],imag[106],real[106]), complex_mul(vec[3],imag[107],real[107]))));
+        temp[7] = vec_add(temp[7], vec_add(vec_add(complex_mul(vec[0],imag[120],real[120]), complex_mul(vec[1],imag[121],real[121])),vec_add(complex_mul(vec[2],imag[122],real[122]), complex_mul(vec[3],imag[123],real[123]))));
+        temp[8] = vec_add(temp[8], vec_add(vec_add(complex_mul(vec[0],imag[136],real[136]), complex_mul(vec[1],imag[137],real[137])),vec_add(complex_mul(vec[2],imag[138],real[138]), complex_mul(vec[3],imag[139],real[139]))));
+        temp[9] = vec_add(temp[9], vec_add(vec_add(complex_mul(vec[0],imag[152],real[152]), complex_mul(vec[1],imag[153],real[153])),vec_add(complex_mul(vec[2],imag[154],real[154]), complex_mul(vec[3],imag[155],real[155]))));
+        temp[10] = vec_add(temp[10], vec_add(vec_add(complex_mul(vec[0],imag[168],real[168]), complex_mul(vec[1],imag[169],real[169])),vec_add(complex_mul(vec[2],imag[170],real[170]), complex_mul(vec[3],imag[171],real[171]))));
+        temp[11] = vec_add(temp[11], vec_add(vec_add(complex_mul(vec[0],imag[184],real[184]), complex_mul(vec[1],imag[185],real[185])),vec_add(complex_mul(vec[2],imag[186],real[186]), complex_mul(vec[3],imag[187],real[187]))));
+        temp[12] = vec_add(temp[12], vec_add(vec_add(complex_mul(vec[0],imag[200],real[200]), complex_mul(vec[1],imag[201],real[201])),vec_add(complex_mul(vec[2],imag[202],real[202]), complex_mul(vec[3],imag[203],real[203]))));
+        temp[13] = vec_add(temp[13], vec_add(vec_add(complex_mul(vec[0],imag[216],real[216]), complex_mul(vec[1],imag[217],real[217])),vec_add(complex_mul(vec[2],imag[218],real[218]), complex_mul(vec[3],imag[219],real[219]))));
+        temp[14] = vec_add(temp[14], vec_add(vec_add(complex_mul(vec[0],imag[232],real[232]), complex_mul(vec[1],imag[233],real[233])),vec_add(complex_mul(vec[2],imag[234],real[234]), complex_mul(vec[3],imag[235],real[235]))));
+        temp[15] = vec_add(temp[15], vec_add(vec_add(complex_mul(vec[0],imag[248],real[248]), complex_mul(vec[1],imag[249],real[249])),vec_add(complex_mul(vec[2],imag[250],real[250]), complex_mul(vec[3],imag[251],real[251]))));
+
+        vec[0] = (__vector double){data_[inds[12]].real(), data_[inds[12]].imag()};
+        vec[1] = (__vector double){data_[inds[13]].real(), data_[inds[13]].imag()};
+        vec[2] = (__vector double){data_[inds[14]].real(), data_[inds[14]].imag()};
+        vec[3] = (__vector double){data_[inds[15]].real(), data_[inds[15]].imag()};
+
+        result = vec_add(temp[0], vec_add(vec_add(complex_mul(vec[0],imag[12],real[12]), complex_mul(vec[1],imag[13],real[13])),vec_add(complex_mul(vec[2],imag[14],real[14]), complex_mul(vec[3],imag[15],real[15]))));
+    data_[inds[0]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[1], vec_add(vec_add(complex_mul(vec[0],imag[28],real[28]), complex_mul(vec[1],imag[29],real[29])),vec_add(complex_mul(vec[2],imag[30],real[30]), complex_mul(vec[3],imag[31],real[31]))));
+        data_[inds[1]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[2], vec_add(vec_add(complex_mul(vec[0],imag[44],real[44]), complex_mul(vec[1],imag[45],real[45])),vec_add(complex_mul(vec[2],imag[46],real[46]), complex_mul(vec[3],imag[47],real[47]))));
+        data_[inds[2]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[3], vec_add(vec_add(complex_mul(vec[0],imag[60],real[60]), complex_mul(vec[1],imag[61],real[61])),vec_add(complex_mul(vec[2],imag[62],real[62]), complex_mul(vec[3],imag[63],real[63]))));
+        data_[inds[3]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[4], vec_add(vec_add(complex_mul(vec[0],imag[76],real[76]), complex_mul(vec[1],imag[77],real[77])),vec_add(complex_mul(vec[2],imag[78],real[78]), complex_mul(vec[3],imag[79],real[79]))));
+        data_[inds[4]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[5], vec_add(vec_add(complex_mul(vec[0],imag[92],real[92]), complex_mul(vec[1],imag[93],real[93])),vec_add(complex_mul(vec[2],imag[94],real[94]), complex_mul(vec[3],imag[95],real[95]))));
+        data_[inds[5]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[6], vec_add(vec_add(complex_mul(vec[0],imag[108],real[108]), complex_mul(vec[1],imag[109],real[109])),vec_add(complex_mul(vec[2],imag[110],real[110]), complex_mul(vec[3],imag[111],real[111]))));
+        data_[inds[6]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[7], vec_add(vec_add(complex_mul(vec[0],imag[124],real[124]), complex_mul(vec[1],imag[125],real[125])),vec_add(complex_mul(vec[2],imag[126],real[126]), complex_mul(vec[3],imag[127],real[127]))));
+        data_[inds[7]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[8], vec_add(vec_add(complex_mul(vec[0],imag[140],real[140]), complex_mul(vec[1],imag[141],real[141])),vec_add(complex_mul(vec[2],imag[142],real[142]), complex_mul(vec[3],imag[143],real[143]))));
+        data_[inds[8]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[9], vec_add(vec_add(complex_mul(vec[0],imag[156],real[156]), complex_mul(vec[1],imag[157],real[157])),vec_add(complex_mul(vec[2],imag[158],real[158]), complex_mul(vec[3],imag[159],real[159]))));
+        data_[inds[9]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[10], vec_add(vec_add(complex_mul(vec[0],imag[172],real[172]), complex_mul(vec[1],imag[173],real[173])),vec_add(complex_mul(vec[2],imag[174],real[174]), complex_mul(vec[3],imag[175],real[175]))));
+        data_[inds[10]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[11], vec_add(vec_add(complex_mul(vec[0],imag[188],real[188]), complex_mul(vec[1],imag[189],real[189])),vec_add(complex_mul(vec[2],imag[190],real[190]), complex_mul(vec[3],imag[191],real[191]))));
+        data_[inds[11]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[12], vec_add(vec_add(complex_mul(vec[0],imag[204],real[204]), complex_mul(vec[1],imag[205],real[205])),vec_add(complex_mul(vec[2],imag[206],real[206]), complex_mul(vec[3],imag[207],real[207]))));
+        data_[inds[12]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[13], vec_add(vec_add(complex_mul(vec[0],imag[220],real[220]), complex_mul(vec[1],imag[221],real[221])),vec_add(complex_mul(vec[2],imag[222],real[222]), complex_mul(vec[3],imag[223],real[223]))));
+        data_[inds[13]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[14], vec_add(vec_add(complex_mul(vec[0],imag[236],real[236]), complex_mul(vec[1],imag[237],real[237])),vec_add(complex_mul(vec[2],imag[238],real[238]), complex_mul(vec[3],imag[239],real[239]))));
+        data_[inds[14]] = std::complex<double>((double)result[0], (double)result[1]);
+        result = vec_add(temp[15], vec_add(vec_add(complex_mul(vec[0],imag[252],real[252]), complex_mul(vec[1],imag[253],real[253])),vec_add(complex_mul(vec[2],imag[254],real[254]), complex_mul(vec[3],imag[255],real[255]))));
+        data_[inds[15]] = std::complex<double>((double)result[0], (double)result[1]);
+      };
+      apply_lambda(lambda, areg_t<4>({{qubits[0], qubits[1], qubits[2], qubits[3]}}), convert(mat));
+      return;
+    } else {
+      // Lambda function for 4-qubit matrix multiplication
+      auto lambda = [&](const areg_t<16> &inds, const cvector_t<data_t> &_mat)->void {
+        std::array<std::complex<data_t>, 16> cache;
+        for (size_t i = 0; i < 16; i++) {
+          const auto ii = inds[i];
+          cache[i] = data_[ii];
+          data_[ii] = 0.;
+        }
+        // update state vector
+        for (size_t i = 0; i < 16; i++)
+          for (size_t j = 0; j < 16; j++)
+            data_[inds[i]] += _mat[i + 16 * j] * cache[j];
+      };
+      apply_lambda(lambda, areg_t<4>({{qubits[0], qubits[1], qubits[2], qubits[3]}}), convert(mat));
+      return;
+      }
+    }
+    default: {
+      const uint_t DIM = BITS[N];
+      // Lambda function for N-qubit matrix multiplication
+      auto lambda = [&](const indexes_t &inds, const cvector_t<data_t> &_mat)->void {
+        auto cache = std::make_unique<std::complex<data_t>[]>(DIM);
+        for (size_t i = 0; i < DIM; i++) {
+          const auto ii = inds[i];
+          cache[i] = data_[ii];
+          data_[ii] = 0.;
+        }
+        // update state vector
+        for (size_t i = 0; i < DIM; i++)
+          for (size_t j = 0; j < DIM; j++)
+            data_[inds[i]] += _mat[i + DIM * j] * cache[j];
+      };
+      apply_lambda(lambda, qubits, convert(mat));
+    }
+  } // end switch
+}
+
+template <typename data_t>
+void QubitVector<data_t>::apply_diagonal_matrix_ppc64le(const reg_t &qubits,
+                                                const cvector_t<double> &diag) {
+  const int_t N = qubits.size();
+  // Error checking
+  #ifdef DEBUG
+  check_vector(diag, N);
+  #endif
+
+  if (N == 1) {
+    apply_diagonal_matrix(qubits[0], diag);
+    return;
+  }
+
+  if(type_double) {
+    auto lambda = [&](const areg_t<2> &inds, const cvector_t<data_t> &_diag)->void {
+      for (int_t i = 0; i < 2; ++i) {
+        const int_t k = inds[i];
+        int_t iv = 0;
+        for (int_t j = 0; j < N; j++)
+          if ((k & (1ULL << qubits[j])) != 0)
+            iv += (1 << j);
+        if (_diag[iv] != (data_t) 1.0){
+	   std::complex<double> test;
+	    __vector double real = (__vector double){_diag[iv].real(), _diag[iv].real()};
+	    __vector double imag = (__vector double){_diag[iv].imag(), _diag[iv].imag() * -1};
+            __vector double vec = (__vector double){data_[k].real(), data_[k].imag()};
+
+            __vector double result = complex_mul(vec,imag,real);
+            data_[k] = std::complex<double>((double)result[0], (double)result[1]);
+#if 0
+            test = std::complex<double>((double)real[0], (double)real[1]);
+	    std::cout << "real " << test << std::endl;
+            test = std::complex<double>((double)imag[0], (double)imag[1]);
+	    std::cout << "imag " << test << std::endl;
+	    std::cout << "diag " << _diag[iv]<< std::endl;
+
+            test = std::complex<double>((double)vec[0], (double)vec[1]);
+	    std::cout << "vec " << test << std::endl;
+	    std::cout << "data_k " << data_[k]<< std::endl;
+
+            __vector double result = complex_mul(vec,imag,real);
+            test = std::complex<double>((double)result[0], (double)result[1]);
+	    std::cout << test << std::endl;
+
+            data_[k] *= _diag[iv];
+	    std::cout << "k " << data_[k]<< std::endl;
+#endif
+	}
+      }
+    };
+    apply_lambda(lambda, areg_t<1>({{qubits[0]}}), convert(diag));
+  } else {
+    auto lambda = [&](const areg_t<2> &inds, const cvector_t<data_t> &_diag)->void {
+      for (int_t i = 0; i < 2; ++i) {
+        const int_t k = inds[i];
+        int_t iv = 0;
+        for (int_t j = 0; j < N; j++)
+          if ((k & (1ULL << qubits[j])) != 0)
+            iv += (1 << j);
+        if (_diag[iv] != (data_t) 1.0)
+          data_[k] *= _diag[iv];
+      }
+    };
+    apply_lambda(lambda, areg_t<1>({{qubits[0]}}), convert(diag));
+  }
+}
+
+
+#endif
+
 
 //------------------------------------------------------------------------------
 } // end namespace QV

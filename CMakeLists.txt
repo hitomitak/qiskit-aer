@@ -208,3 +208,8 @@ endif()
 if(BUILD_TESTS)
 	add_subdirectory(test)
 endif()
+
+if(${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64le")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DSIMD_PPC64LE")
+        enable_cxx_compiler_flag_if_supported("-maltivec")
+endif()
